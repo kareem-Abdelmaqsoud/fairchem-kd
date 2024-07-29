@@ -1,0 +1,6 @@
+includes:
+  - configs/s2ef/200k/painn/painn_base_distill.yml
+trainer: distill
+distillation:
+  distill_loss: vec2vec_distill_loss 
+  distill_lambda: 50000.0 # better than 0.5, 0.1

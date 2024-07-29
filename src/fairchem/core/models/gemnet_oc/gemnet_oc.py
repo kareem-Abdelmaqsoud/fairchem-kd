@@ -234,6 +234,12 @@ class GemNetOC(BaseModel):
         num_elements: int = 83,
         otf_graph: bool = False,
         scale_file: str | None = None,
+        distill_reduce: str = "sum",
+        distill_layer_code: str = "concatmlp",
+        teacher_node_dim: int = 256,
+        teacher_edge_dim: int = 512,
+        use_distill: bool = False,
+        id_mapping: bool = False,
         **kwargs,  # backwards compatibility with deprecated arguments
     ) -> None:
         if qint_tags is None:
@@ -253,6 +259,32 @@ class GemNetOC(BaseModel):
         assert num_blocks > 0
         self.num_blocks = num_blocks
         self.extensive = extensive
+        
+        # distillation: mapping different embeddings of the teacher and the student models 
+        if use_distill and not id_mapping:
+            self.n2n_mapping = nn.Linear(emb_size_atom, teacher_node_dim)
+            self.e2e_mapping = nn.Linear(emb_size_edge, teacher_edge_dim)
+        else:
+            self.n2n_mapping = nn.Identity()
+            self.e2e_mapping = nn.Identity()
+        print("n2n_mapping:\n", self.n2n_mapping)
+        print("e2e_mapping:\n", self.e2e_mapping)
+
+        self.distill_reduce = distill_reduce
+        if distill_layer_code.lower() == "concatmlp":
+            self.distill_layer_num = num_blocks + 2
+            self.distill_layer_type = None
+        else:
+            (
+                self.distill_layer_type,
+                self.distill_layer_num,
+            ) = distill_layer_code.split("_")
+            self.distill_layer_type = self.distill_layer_type.lower()
+            assert self.distill_layer_type in [
+                "regular",
+                "x",
+            ], f"Unknown distill layer type: {self.distill_layer_type}"
+            self.distill_layer_num = int(self.distill_layer_num)
 
         self.atom_edge_interaction = atom_edge_interaction
         self.edge_atom_interaction = edge_atom_interaction
@@ -1333,3 +1365,190 @@ class GemNetOC(BaseModel):
     @property
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
+    
+    def extract_features(self, data_and_graph):
+        data = data_and_graph[0]
+        pos = data.pos
+        batch = data.batch
+        atomic_numbers = data.atomic_numbers.long()
+        num_atoms = atomic_numbers.shape[0]
+
+        if self.regress_forces and not self.direct_forces:
+            pos.requires_grad_(True)
+
+        (
+            main_graph,
+            a2a_graph,
+            a2ee2a_graph,
+            qint_graph,
+            id_swap,
+            trip_idx_e2e,
+            trip_idx_a2e,
+            trip_idx_e2a,
+            quad_idx,
+        ) = self.get_graphs_and_indices(data)
+        _, idx_t = main_graph["edge_index"]
+
+        (
+            basis_rad_raw,
+            basis_atom_update,
+            basis_output,
+            bases_qint,
+            bases_e2e,
+            bases_a2e,
+            bases_e2a,
+            basis_a2a_rad,
+        ) = self.get_bases(
+            main_graph=main_graph,
+            a2a_graph=a2a_graph,
+            a2ee2a_graph=a2ee2a_graph,
+            qint_graph=qint_graph,
+            trip_idx_e2e=trip_idx_e2e,
+            trip_idx_a2e=trip_idx_a2e,
+            trip_idx_e2a=trip_idx_e2a,
+            quad_idx=quad_idx,
+            num_atoms=num_atoms,
+        )
+        features_to_distill = None
+        # Embedding block
+        h = self.atom_emb(atomic_numbers)
+        # (nAtoms, emb_size_atom)
+        m = self.edge_emb(h, basis_rad_raw, main_graph["edge_index"])
+        # (nEdges, emb_size_edge)
+        x_E, x_F = self.out_blocks[0](h, m, basis_output, idx_t)
+        if self.distill_layer_num == 0:
+            if self.distill_layer_type == "regular":
+                features_to_distill = [h, m]
+            else:
+                features_to_distill = [x_E, x_F]
+        # (nAtoms, emb_size_atom), (nEdges, emb_size_edge)
+        xs_E, xs_F = [x_E], [x_F]
+
+        for i in range(self.num_blocks):
+            # Interaction block
+            h, m = self.int_blocks[i](
+                h=h,
+                m=m,
+                bases_qint=bases_qint,
+                bases_e2e=bases_e2e,
+                bases_a2e=bases_a2e,
+                bases_e2a=bases_e2a,
+                basis_a2a_rad=basis_a2a_rad,
+                basis_atom_update=basis_atom_update,
+                edge_index_main=main_graph["edge_index"],
+                a2ee2a_graph=a2ee2a_graph,
+                a2a_graph=a2a_graph,
+                id_swap=id_swap,
+                trip_idx_e2e=trip_idx_e2e,
+                trip_idx_a2e=trip_idx_a2e,
+                trip_idx_e2a=trip_idx_e2a,
+                quad_idx=quad_idx,
+            )  # (nAtoms, emb_size_atom), (nEdges, emb_size_edge)
+
+            x_E, x_F = self.out_blocks[i + 1](h, m, basis_output, idx_t)
+            if self.distill_layer_num == (i + 1):
+                if self.distill_layer_type == "regular":
+                    features_to_distill = [h, m]
+                else:
+                    features_to_distill = [x_E, x_F]
+            # (nAtoms, emb_size_atom), (nEdges, emb_size_edge)
+            xs_E.append(x_E)
+            xs_F.append(x_F)
+
+        # Global output block for final predictions
+        x_E = self.out_mlp_E(torch.cat(xs_E, dim=-1))
+        if self.direct_forces:
+            x_F = self.out_mlp_F(torch.cat(xs_F, dim=-1))
+
+        if features_to_distill is None:
+            features_to_distill = [
+                self.n2n_mapping(x_E),
+                self.e2e_mapping(x_F),
+            ]
+        
+        # if self.distill_final_features:
+        #    features_to_distill = [h, m]
+        # else:
+        #    features_to_distill = [x_E, x_F]
+
+        with torch.cuda.amp.autocast(False):
+            E_t = self.out_energy(x_E.float())
+            E_per_atom = E_t.squeeze()
+            if self.direct_forces:
+                F_st = self.out_forces(x_F.float())
+
+        nMolecules = torch.max(batch) + 1
+        if self.extensive:
+            E_t = scatter(
+                E_t, batch, dim=0, dim_size=nMolecules, reduce="add"
+            )  # (nMolecules, num_targets)
+        else:
+            E_t = scatter(
+                E_t, batch, dim=0, dim_size=nMolecules, reduce="mean"
+            )  # (nMolecules, num_targets)
+        
+        with torch.cuda.amp.autocast(False):
+            m2h = scatter(
+                features_to_distill[1].float(),
+                idx_t,
+                dim=0,
+                dim_size=num_atoms,
+                reduce=self.distill_reduce,
+            )
+            m2v = scatter(
+                features_to_distill[1].float().unsqueeze(1)
+                * main_graph["vector"].unsqueeze(-1),
+                idx_t,
+                dim=0,
+                dim_size=num_atoms,
+                reduce=self.distill_reduce,
+            )
+        with torch.cuda.amp.autocast(False):
+            features_to_distill = [
+                features_to_distill[0].float(),
+                m2h.float(),
+                m2v.float(),
+                features_to_distill[1].float(),
+            ]
+        main_graph["id_swap"] = id_swap
+        if self.regress_forces:
+            if self.direct_forces:
+                if self.forces_coupled:  # enforce F_st = F_ts
+                    nEdges = idx_t.shape[0]
+                    id_undir = repeat_blocks(
+                        main_graph["num_neighbors"] // 2,
+                        repeats=2,
+                        continuous_indexing=True,
+                    )
+                    F_st = scatter(
+                        F_st,
+                        id_undir,
+                        dim=0,
+                        dim_size=int(nEdges / 2),
+                        reduce="mean",
+                    )  # (nEdges/2, num_targets)
+                    F_st = F_st[id_undir]  # (nEdges, num_targets)
+
+                # map forces in edge directions
+                F_st_vec = F_st[:, :, None] * main_graph["vector"][:, None, :]
+                # (nEdges, num_targets, 3)
+                F_t = scatter(
+                    F_st_vec,
+                    idx_t,
+                    dim=0,
+                    dim_size=num_atoms,
+                    reduce="add",
+                )  # (nAtoms, num_targets, 3)
+            else:
+                F_t = self.force_scaler.calc_forces_and_update(E_t, pos)
+
+            E_t = E_t.squeeze(1)  # (num_molecules)
+            F_t = F_t.squeeze(1)  # (num_atoms, 3)
+            return (
+                features_to_distill,
+                [E_t, F_t, E_per_atom],
+                main_graph,
+            )  # (nMolecules, num_targets), (nAtoms, 3)
+        else:
+            E_t = E_t.squeeze(1)  # (num_molecules)
+            return features_to_distill, E_t, main_graph

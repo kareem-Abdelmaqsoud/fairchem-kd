@@ -1,0 +1,6 @@
+includes:
+  - configs/s2ef/200k/painn/painn_base_distill.yml
+trainer: distill
+distillation:
+  distill_loss: node2node_distill_loss
+  distill_lambda: 10000.0

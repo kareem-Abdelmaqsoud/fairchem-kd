@@ -1,0 +1,7 @@
+includes:
+  - configs/s2ef/200k/painn/painn_h512.yml
+trainer: distill
+
+distillation:
+  distill_loss: per_atom_energy_distill_loss
+  distill_lambda: 10.0

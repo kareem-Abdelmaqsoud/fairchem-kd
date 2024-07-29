@@ -50,6 +50,8 @@ from fairchem.core.modules.scaling.compat import load_scales_compat
 from .utils import get_edge_id, repeat_blocks
 
 
+# TODO: the best way for using distillation is to implement a DistillModel class, and initize student and teacher model there.
+# TODO: here, I am doing a dirty code, where I just pass distill_args to student model (painn)
 @registry.register_model("painn")
 class PaiNN(BaseModel):
     r"""PaiNN model based on the description in Schütt et al. (2021):
@@ -75,6 +77,13 @@ class PaiNN(BaseModel):
         otf_graph: bool = True,
         num_elements: int = 83,
         scale_file: str | None = None,
+        teacher_node_dim: int = 256,
+        teacher_edge_dim: int = 512,
+        use_distill: bool = False,
+        projection_head: bool = False,
+        id_mapping: bool = False,
+        distill_layer_code: str  = "U6",
+        force_linear_n2n: bool = False,
     ) -> None:
         if envelope is None:
             envelope = {"name": "polynomial", "exponent": 5}
@@ -91,7 +100,92 @@ class PaiNN(BaseModel):
         self.direct_forces = direct_forces
         self.otf_graph = otf_graph
         self.use_pbc = use_pbc
+        
+        # for distillation
+        if use_distill:
+            distill_layers = [
+                code.lower() for code in distill_layer_code.split("_")
+            ]
+            distill_layers = [
+                (code[0], int(code[1:])) for code in distill_layers
+            ]
+            distill_layers = sorted(
+                distill_layers, key=lambda tup: (tup[1], tup[0])
+            )  # Sort primarly on layer number, then on m/u
+            assert all(
+                code[1] > 0 for code in distill_layers
+            ), "Distill layer number in Painn is less than 1"
+            assert all(
+                code[1] <= num_layers for code in distill_layers
+            ), "Distill layer number in Painn is large than num_layers"
+            assert all(
+                code[0] in ["m", "u"] for code in distill_layers
+            ), "Distill layer type in Painn not m nor u"
+            self.distill_layers = distill_layers
+            self.num_distill_layers = len(self.distill_layers)
 
+            if projection_head:
+                self.n2n_mapping = nn.Sequential(
+                    nn.Linear(
+                        self.num_distill_layers * hidden_channels,
+                        2 * hidden_channels,
+                    ),
+                    nn.ReLU(),
+                    nn.Linear(2 * hidden_channels, teacher_node_dim),
+                )
+            elif id_mapping and not force_linear_n2n:
+                self.n2n_mapping = nn.Identity()
+            else:
+                self.n2n_mapping = nn.Linear(
+                    self.num_distill_layers * hidden_channels, teacher_node_dim
+                )
+            print("n2n_mapping:\n", self.n2n_mapping)
+
+            if id_mapping:
+                self.v2v_mapping = nn.Identity()
+            else:
+                self.v2v_mapping = nn.Linear(
+                    self.num_distill_layers * hidden_channels,
+                    teacher_edge_dim,
+                    bias=False,
+                )
+            print("v2v_mapping:\n", self.v2v_mapping)
+
+            if projection_head:
+                self.n2e_mapping = nn.Sequential(
+                    nn.Linear(
+                        self.num_distill_layers * hidden_channels,
+                        2 * hidden_channels,
+                    ),
+                    nn.ReLU(),
+                    nn.Linear(2 * hidden_channels, teacher_edge_dim),
+                )
+            elif id_mapping:
+                self.n2e_mapping = nn.Identity()
+            else:
+                self.n2e_mapping = nn.Linear(
+                    self.num_distill_layers * hidden_channels, teacher_edge_dim
+                )
+            print("n2e_mapping:\n", self.n2e_mapping)
+
+            if projection_head:
+                self.e2e_mapping = nn.Sequential(
+                    nn.Linear(
+                        self.num_distill_layers * hidden_channels,
+                        2 * hidden_channels,
+                    ),
+                    nn.ReLU(),
+                    nn.Linear(2 * hidden_channels, teacher_edge_dim),
+                )
+            elif id_mapping:
+                self.e2e_mapping = nn.Identity()
+            else:
+                self.e2e_mapping = nn.Linear(
+                    self.num_distill_layers * hidden_channels, teacher_edge_dim
+                )
+            print("e2e_mapping:\n", self.e2e_mapping)
+
+            
         # Borrowed from GemNet.
         self.symmetric_edge_symmetrization = False
 
@@ -420,6 +514,108 @@ class PaiNN(BaseModel):
             outputs["forces"] = forces
 
         return outputs
+    
+    def extract_features(self, data_and_graph):
+        data = data_and_graph[0]
+        main_graph = data_and_graph[1]
+        pos = data.pos
+        batch = data.batch
+        z = data.atomic_numbers.long()
+
+        if self.regress_forces and not self.direct_forces:
+            pos = pos.requires_grad_(True)
+
+        if main_graph is None:
+            (
+                edge_index,
+                neighbors,
+                edge_dist,
+                edge_vector,
+                id_swap,
+            ) = self.generate_graph(data)
+        else:
+            edge_index = main_graph["edge_index"]
+            edge_dist = main_graph["distance"]
+            edge_vector = -main_graph["vector"]
+
+        assert z.dim() == 1 and z.dtype == torch.long
+
+        edge_rbf = self.radial_basis(edge_dist)  # rbf * envelope
+
+        x = self.atom_emb(z)
+        vec = torch.zeros(x.size(0), 3, x.size(1), device=x.device)
+
+        #### Interaction blocks ###############################################
+        x_list, vec_list = [], []
+        distill_layers_iter = iter(self.distill_layers)
+        distill_layer = next(distill_layers_iter, (None, None))
+        for i in range(self.num_layers):
+            dx, dvec = self.message_layers[i](
+                x, vec, edge_index, edge_rbf, edge_vector
+            )
+
+            x = x + dx
+            vec = vec + dvec
+            x = x * self.inv_sqrt_2
+            if distill_layer == ("m", i + 1):
+                x_list.append(x.clone())
+                vec_list.append(vec.clone())
+                distill_layer = next(distill_layers_iter, (None, None))
+
+            dx, dvec = self.update_layers[i](x, vec)
+
+            x = x + dx
+            vec = vec + dvec
+            x = getattr(self, "upd_out_scalar_scale_%d" % i)(x)
+            if distill_layer == ("u", i + 1):
+                x_list.append(x.clone())
+                vec_list.append(vec.clone())
+                distill_layer = next(distill_layers_iter, (None, None))
+        assert distill_layer == (None, None)
+        node_feat = torch.hstack(x_list)
+        vec_feat = torch.cat(vec_list, dim=-1)
+        #### Output block #####################################################
+        vec1 = vec_feat[edge_index[0]]
+        vec2 = vec_feat[edge_index[1]]
+        e_feat = (vec1 * vec2).sum(dim=-2)
+
+        with torch.cuda.amp.autocast(False):
+            x = x.float()
+            vec = vec.float()
+            e_feat = e_feat.float()  # using from the latest layer
+            per_atom_energy = self.out_energy(x).squeeze(1)
+            energy = scatter(per_atom_energy, batch, dim=0)
+            if self.regress_forces:
+                if self.direct_forces:
+                    forces = self.out_forces(x, vec)
+                else:
+                    forces = (
+                        -1
+                        * torch.autograd.grad(
+                            x,
+                            pos,
+                            grad_outputs=torch.ones_like(x),
+                            create_graph=True,
+                        )[0]
+                    )
+                # return [x_list, vec_list], [energy, forces]
+                return (
+                    [
+                        self.n2n_mapping(node_feat.float()),
+                        self.n2e_mapping(node_feat.float()),
+                        self.v2v_mapping(vec_feat.float()),
+                        self.e2e_mapping(e_feat),
+                    ],
+                    [energy, forces, per_atom_energy],
+                    main_graph,
+                )
+            else:
+                # return [x_list, vec_list], energy
+                return [
+                    self.n2n_mapping(node_feat.float()),
+                    self.n2e_mapping(node_feat.float()),
+                    self.v2v_mapping(vec_feat.float()),
+                ], energy
 
     @property
     def num_params(self) -> int:

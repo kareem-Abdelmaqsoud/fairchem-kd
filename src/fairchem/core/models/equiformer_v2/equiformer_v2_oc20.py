@@ -151,6 +151,12 @@ class EquiformerV2_OC20(BaseModel):
         avg_degree: float | None = None,
         use_energy_lin_ref: bool | None = False,
         load_energy_lin_ref: bool | None = False,
+                distill_reduce: str = "sum",
+        distill_layer_code: str = "concatmlp",
+        teacher_node_dim: int = 128,
+        teacher_edge_dim: int = 512,
+        use_distill: bool = False,
+        id_mapping: bool = False,
     ):
         if mmax_list is None:
             mmax_list = [2]
@@ -186,6 +192,32 @@ class EquiformerV2_OC20(BaseModel):
         self.grid_resolution = grid_resolution
 
         self.num_sphere_samples = num_sphere_samples
+        
+        # distillation: mapping different embeddings of the teacher and the student models 
+        if use_distill and not id_mapping:
+            self.n2n_mapping = nn.Linear(sphere_channels, teacher_node_dim)
+            self.e2e_mapping = nn.Linear(600, teacher_edge_dim)
+        else:
+            self.n2n_mapping = nn.Identity()
+            self.e2e_mapping = nn.Identity()
+        print("n2n_mapping:\n", self.n2n_mapping)
+        print("e2e_mapping:\n", self.e2e_mapping)
+
+        self.distill_reduce = distill_reduce
+        if distill_layer_code.lower() == "concatmlp":
+            self.distill_layer_num = num_layers + 2
+            self.distill_layer_type = None
+        else:
+            (
+                self.distill_layer_type,
+                self.distill_layer_num,
+            ) = distill_layer_code.split("_")
+            self.distill_layer_type = self.distill_layer_type.lower()
+            assert self.distill_layer_type in [
+                "regular",
+                "x",
+            ], f"Unknown distill layer type: {self.distill_layer_type}"
+            self.distill_layer_num = int(self.distill_layer_num)
 
         self.edge_channels = edge_channels
         self.use_atom_edge_embedding = use_atom_edge_embedding
@@ -678,3 +710,156 @@ class EquiformerV2_OC20(BaseModel):
                     no_wd_list.append(global_parameter_name)
 
         return set(no_wd_list)
+    
+    def extract_features(self, data_and_graph):
+        data = data_and_graph[0]
+        batch_size = len(data.natoms)
+        dtype = data.pos.dtype
+        device = data.pos.device
+
+        atomic_numbers = data.atomic_numbers.long()
+        num_atoms = len(atomic_numbers)
+
+
+        main_graph = self.generate_graph(
+            data,
+            enforce_max_neighbors_strictly = self.enforce_max_neighbors_strictly,
+        )
+        (
+            edge_index,
+            edge_distance,
+            edge_distance_vec,
+            cell_offsets,
+            _,  # cell offset distances
+            neighbors,
+        ) = main_graph
+        _, idx_t = edge_index
+        ###############################################################
+        # Initialize data structures
+        ###############################################################
+
+        # Compute 3x3 rotation matrix per edge
+        edge_rot_mat = self._init_edge_rot_mat(data, edge_index, edge_distance_vec)
+
+        # Initialize the WignerD matrices and other values for spherical harmonic calculations
+        for i in range(self.num_resolutions):
+            self.SO3_rotation[i].set_wigner(edge_rot_mat)
+
+        ###############################################################
+        # Initialize node embeddings
+        ###############################################################
+
+        # Init per node representations using an atomic number based embedding
+        offset = 0
+        x = SO3_Embedding(
+            num_atoms,
+            self.lmax_list,
+            self.sphere_channels,
+            device,
+            dtype,
+        )
+        offset_res = 0
+        offset = 0
+        # Initialize the l = 0, m = 0 coefficients for each resolution
+        for i in range(self.num_resolutions):
+            if self.num_resolutions == 1:
+                x.embedding[:, offset_res, :] = self.sphere_embedding(atomic_numbers)
+            else:
+                x.embedding[:, offset_res, :] = self.sphere_embedding(atomic_numbers)[
+                    :, offset : offset + self.sphere_channels
+                ]
+            offset = offset + self.sphere_channels
+            offset_res = offset_res + int((self.lmax_list[i] + 1) ** 2)
+        
+        # Edge encoding (distance and atom edge)
+        edge_distance = self.distance_expansion(edge_distance)
+        if self.share_atom_edge_embedding and self.use_atom_edge_embedding:
+            source_element = atomic_numbers[edge_index[0]]  # Source atom atomic number
+            target_element = atomic_numbers[edge_index[1]]  # Target atom atomic number
+            source_embedding = self.source_embedding(source_element)
+            target_embedding = self.target_embedding(target_element)
+            edge_distance = torch.cat(
+                (edge_distance, source_embedding, target_embedding), dim=1
+            )
+        
+        # Edge-degree embedding
+        edge_degree = self.edge_degree_embedding(
+            atomic_numbers, edge_distance, edge_index
+        )
+        x.embedding = x.embedding + edge_degree.embedding
+
+        ###############################################################
+        # Update spherical node embeddings
+        ###############################################################
+        for i in range(self.num_layers):
+            x = self.blocks[i](
+                x,  # SO3_Embedding
+                atomic_numbers,
+                edge_distance,
+                edge_index,
+                batch=data.batch,  # for GraphDropPath
+            )
+
+        # Final layer norm
+        x.embedding = self.norm(x.embedding)
+
+        features_to_distill = None
+        if features_to_distill is None:
+            ## pick l=0 and m=0 spherical hamonics because it is invariant 
+            node_embedding = x.embedding[:,0,:]
+            features_to_distill = [
+                self.n2n_mapping(node_embedding),
+                self.e2e_mapping(edge_distance),
+            ]
+        
+        with torch.cuda.amp.autocast(False):
+            m2h = scatter(
+                features_to_distill[1].float(),
+                idx_t,
+                dim=0,
+                dim_size=num_atoms,
+                reduce=self.distill_reduce,
+            )
+            m2v = scatter(
+                features_to_distill[1].float().unsqueeze(1)
+                * main_graph[2].unsqueeze(-1),
+                idx_t,
+                dim=0,
+                dim_size=num_atoms,
+                reduce=self.distill_reduce,
+            )
+        with torch.cuda.amp.autocast(False):
+            features_to_distill = [
+                features_to_distill[0].float(),
+                m2h.float(),
+                m2v.float(),
+                features_to_distill[1].float(),
+            ]
+
+        ###############################################################
+        # Energy estimation
+        ###############################################################
+        node_energy = self.energy_block(x)
+        node_energy = node_energy.embedding.narrow(1, 0, 1)
+        energy = torch.zeros(
+            len(data.natoms),
+            device=node_energy.device,
+            dtype=node_energy.dtype,
+        )
+        energy.index_add_(0, data.batch, node_energy.view(-1))
+        energy = energy / self.avg_num_nodes
+        outputs = {"energy": energy}
+
+        ###############################################################
+        # Force estimation
+        ###############################################################
+        if self.regress_forces:
+            forces = self.force_block(x, atomic_numbers, edge_distance, edge_index)
+            forces = forces.embedding.narrow(1, 1, 3)
+            forces = forces.view(-1, 3)
+            outputs["forces"] = forces
+        return (
+                features_to_distill,
+                [outputs["energy"], outputs["forces"], node_energy.view(-1)],
+                main_graph
+            )

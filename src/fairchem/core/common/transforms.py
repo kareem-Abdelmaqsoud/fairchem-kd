@@ -78,3 +78,81 @@ class RandomRotate:
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.degrees}, axis={self.axis})"
+
+class RandomJitter(object):
+    r"""With a certain probability translates node positions by randomly sampled translation values
+    within a given interval (functional name: :obj:`random_jitter`).
+    In contrast to other random transformations,
+    translation is applied separately at each position
+
+    Args:
+        translate (sequence or float or int): Maximum translation in each
+            dimension, defining the range
+            :math:`(-\mathrm{translate}, +\mathrm{translate})` to sample from.
+            If :obj:`translate` is a number instead of a sequence, the same
+            range is used for each dimension.
+        prob (float): Probability (0 to 1) of translating positions
+    """
+
+    def __init__(self, config):
+        self.std_dev = config.get("std_dev", 0.1)
+        self.prob = config.get("translation_probability", 1.0)
+        assert (
+            self.prob <= 1.0
+        ), "Probabiltiy of RandomJitter needs to be maximum 1.0"
+        self.fixed_norm = config.get("fixed_norm", None)
+
+    def __call__(self, data):
+        if random.random() < self.prob:
+            non_fixed_elements = ~data.fixed.bool()
+            (n, dim), t = data.pos[non_fixed_elements].size(), self.std_dev
+            if isinstance(t, numbers.Number):
+                t = list(repeat(t, times=dim))
+            assert len(t) == dim
+
+            ts = []
+            for d in range(dim):
+                ts.append(
+                    data.pos[non_fixed_elements]
+                    .new_empty(n)
+                    .normal_(0, abs(t[d]))
+                )
+
+            displacement = torch.stack(ts, dim=-1)
+            if self.fixed_norm is not None:
+                displacement = self.fixed_norm * torch.nn.functional.normalize(
+                    displacement
+                )
+            data.pos[non_fixed_elements] = (
+                data.pos[non_fixed_elements] + displacement
+            )
+        return data
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}({{"max_translation": {self.translate}, "translation_probability": {self.prob}}})'
+
+    
+class AddNoise(object):
+    r"""With a certain probability translates node positions by randomly sampled translation values
+    within a given interval (functional name: :obj:`random_jitter`).
+    In contrast to other random transformations,
+    translation is applied separately at each position
+
+    Args:
+        translate (sequence or float or int): Maximum translation in each
+            dimension, defining the range
+            :math:`(-\mathrm{translate}, +\mathrm{translate})` to sample from.
+            If :obj:`translate` is a number instead of a sequence, the same
+            range is used for each dimension.
+        prob (float): Probability (0 to 1) of translating positions
+    """
+
+    def __call__(self, data, delta):
+        non_fixed_elements = ~data.fixed.bool()
+        data.pos[non_fixed_elements] = (
+            data.pos[non_fixed_elements] + delta[non_fixed_elements]
+        )
+        return data
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}()"

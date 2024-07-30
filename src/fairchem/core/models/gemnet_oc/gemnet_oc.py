@@ -10,6 +10,7 @@ import logging
 
 import numpy as np
 import torch
+from torch import nn
 from torch_scatter import segment_coo
 
 from fairchem.core.common.registry import registry
@@ -772,6 +773,7 @@ class GemNetOC(BaseModel):
         We only use i->j edges here. So we lose some j->i edges
         and add others by making it symmetric.
         """
+        # import pdb; pdb.set_trace()
         num_atoms = batch_idx.shape[0]
         new_graph = {}
 
@@ -1038,7 +1040,8 @@ class GemNetOC(BaseModel):
             del qint_graph["num_neighbors"]
         else:
             qint_graph = {}
-
+        
+        # import pdb; pdb.set_trace()
         # Symmetrize edges for swapping in symmetric message passing
         main_graph, id_swap = self.symmetrize_edges(main_graph, data.batch)
 

@@ -8,7 +8,7 @@ model:
   teacher_edge_dim: 512
   
 
-teacher_path: pretrained/eq2_83M_2M.pt
+teacher_path: /pscratch/sd/k/kabdelma/pretrained_models/eq2_83M_2M.pt
 teacher_model:
   name: equiformer_v2
 

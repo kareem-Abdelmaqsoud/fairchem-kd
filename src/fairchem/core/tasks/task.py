@@ -12,6 +12,7 @@ import os
 
 from fairchem.core.common.registry import registry
 from fairchem.core.trainers import OCPTrainer
+from fairchem.core.trainers import DistillForcesTrainer
 
 
 class BaseTask:

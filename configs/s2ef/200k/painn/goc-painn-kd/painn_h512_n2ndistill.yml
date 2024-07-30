@@ -1,5 +1,5 @@
 includes:
-  - configs/s2ef/200k/painn/painn_base_distill.yml
+  - configs/s2ef/200k/painn/goc-painn-kd/painn_base_distill.yml
 trainer: distill
 distillation:
   distill_loss: node2node_distill_loss

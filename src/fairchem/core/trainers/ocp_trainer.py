@@ -91,6 +91,7 @@ class OCPTrainer(BaseTrainer):
         noddp=False,
         name="ocp",
         gp_gpus=None,
+        **kwargs
     ):
         if slurm is None:
             slurm = {}

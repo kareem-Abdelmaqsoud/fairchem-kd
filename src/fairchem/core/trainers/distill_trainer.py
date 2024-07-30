@@ -132,65 +132,79 @@ class DistillForcesTrainer(BaseTrainer):
         slurm (dict): Slurm configuration. Currently just for keeping track.
             (default: :obj:`{}`)
     """
-
     def __init__(
         self,
         task,
         model,
+        outputs,
         dataset,
         optimizer,
+        loss_functions,
+        evaluation_metrics,
         identifier,
-        normalizer=None,
+        teacher_model,
+        teacher_path,
+        distillation,
         timestamp_id=None,
         run_dir=None,
         is_debug=False,
-        is_hpo=False,
         print_every=100,
         seed=None,
-        logger="tensorboard",
+        logger="wandb",
         local_rank=0,
         amp=False,
         cpu=False,
-        slurm={},
+        slurm=None,
         noddp=False,
-        config=None,
-        **kwargs,
+        name="distill",
+        gp_gpus=None,
+        
     ):
+        if slurm is None:
+            slurm = {}
         super().__init__(
             task=task,
             model=model,
+            outputs=outputs,
             dataset=dataset,
             optimizer=optimizer,
+            loss_functions=loss_functions,
+            evaluation_metrics=evaluation_metrics,
             identifier=identifier,
-            normalizer=normalizer,
             timestamp_id=timestamp_id,
             run_dir=run_dir,
             is_debug=is_debug,
-            is_hpo=is_hpo,
             print_every=print_every,
             seed=seed,
             logger=logger,
             local_rank=local_rank,
             amp=amp,
             cpu=cpu,
-            name="s2ef",
             slurm=slurm,
             noddp=noddp,
+            name=name,
+            gp_gpus=gp_gpus,
         )
         # TODO: the way using config is quite strange. Clean the code.
-        teacher_config = config["teacher_model"]
+        teacher_config = teacher_model
         teacher_model = teacher_config.pop("name")
         teacher_model_attributes = teacher_config
         self.config["teacher_model_attributes"] = teacher_model_attributes
-        self.config["distillation"] = config["distillation"]
+        self.config["distillation"] = distillation
+        
+        # TODO: depreicated, remove.
+        bond_feat_dim = None
+        bond_feat_dim = self.config["model_attributes"].get("num_gaussians", 50)
+        
+        loader = self.train_loader or self.val_loader or self.test_loader
         self.teacher = registry.get_model_class(teacher_model)(
-            self.loader.dataset[0].x.shape[-1]
-            if self.loader
-            and hasattr(self.loader.dataset[0], "x")
-            and self.loader.dataset[0].x is not None
+            loader.dataset[0].x.shape[-1]
+            if loader
+            and hasattr(loader.dataset[0], "x")
+            and loader.dataset[0].x is not None
             else None,
-            self.bond_feat_dim,
-            self.num_targets,
+            bond_feat_dim,
+            1,
             **teacher_model_attributes,
         ).to(self.device)
         self.teacher = OCPDataParallel(
@@ -202,7 +216,7 @@ class DistillForcesTrainer(BaseTrainer):
             self.teacher = OCPDistributedDataParallel(
                 self.teacher, device_ids=[self.device]
             )
-        self.load_teacher(config["teacher_path"])
+        self.load_teacher(teacher_path)
         self.teacher.eval()
         if "random_jitter" in self.config["distillation"]["distill_loss"]:
             self.random_std = self.config["distillation"].get(
@@ -301,46 +315,6 @@ class DistillForcesTrainer(BaseTrainer):
         self.use_huber = self.config["distillation"].get("use_huber", False)
         self.huber_delta = self.config["distillation"].get("huber_delta", 1.0)
 
-    def load_task(self):
-        logging.info(f"Loading dataset: {self.config['task']['dataset']}")
-
-        if "relax_dataset" in self.config["task"]:
-            self.relax_dataset = registry.get_dataset_class("lmdb")(
-                self.config["task"]["relax_dataset"]
-            )
-            self.relax_sampler = self.get_sampler(
-                self.relax_dataset,
-                self.config["optim"].get(
-                    "eval_batch_size", self.config["optim"]["batch_size"]
-                ),
-                shuffle=False,
-            )
-            self.relax_loader = self.get_dataloader(
-                self.relax_dataset,
-                self.relax_sampler,
-            )
-
-        self.num_targets = 1
-
-        # If we're computing gradients wrt input, set mean of normalizer to 0 --
-        # since it is lost when compute dy / dx -- and std to forward target std
-        if self.config["model_attributes"].get("regress_forces", True):
-            if self.normalizer.get("normalize_labels", False):
-                if "grad_target_mean" in self.normalizer:
-                    self.normalizers["grad_target"] = Normalizer(
-                        mean=self.normalizer["grad_target_mean"],
-                        std=self.normalizer["grad_target_std"],
-                        device=self.device,
-                    )
-                else:
-                    self.normalizers["grad_target"] = Normalizer(
-                        tensor=self.train_loader.dataset.data.y[
-                            self.train_loader.dataset.__indices__
-                        ],
-                        device=self.device,
-                    )
-                    self.normalizers["grad_target"].mean.fill_(0)
-
     def load_teacher(self, checkpoint_path):
         logging.info(f"Loading checkpoint from: {checkpoint_path}")
         map_location = torch.device("cpu") if self.cpu else self.device
@@ -356,7 +330,6 @@ class DistillForcesTrainer(BaseTrainer):
             # No need for OrderedDict since dictionaries are technically ordered
             # since Python 3.6 and officially ordered since Python 3.7
             new_dict = {k[7:]: v for k, v in checkpoint["state_dict"].items()}
-            # import pdb; pdb.set_trace()
             self.teacher.load_state_dict(new_dict, strict= strict)
         elif distutils.initialized() and first_key.split(".")[1] != "module":
             new_dict = {
@@ -994,7 +967,7 @@ class DistillForcesTrainer(BaseTrainer):
         checkpoint_every = self.config["optim"].get(
             "checkpoint_every", eval_every
         )
-        primary_metric = self.config["task"].get(
+        primary_metric = self.evaluation_metrics.get(
             "primary_metric", self.evaluator.task_primary_metric[self.name]
         )
         if (

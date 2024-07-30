@@ -1024,6 +1024,9 @@ def new_trainer_context(*, config: dict[str, Any], distributed: bool = False):
             noddp=config.get("noddp", False),
             name=task_name,
             gp_gpus=config.get("gp_gpus"),
+            teacher_model = config.get("teacher_model", {}),
+            distillation = config.get("distillation", {}),
+            teacher_path = config.get("teacher_path", None),
         )
 
         task_cls = registry.get_task_class(config["mode"])

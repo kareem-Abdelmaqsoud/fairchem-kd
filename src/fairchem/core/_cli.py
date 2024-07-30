@@ -35,6 +35,7 @@ class Runner(Checkpointable):
 
     def __call__(self, config: dict) -> None:
         with new_trainer_context(config=config, distributed=self.distributed) as ctx:
+            # import pdb; pdb.set_trace()
             self.config = ctx.config
             self.task = ctx.task
             self.trainer = ctx.trainer

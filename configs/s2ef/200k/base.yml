@@ -3,7 +3,7 @@ trainer: ocp
 dataset:
   train:
     format: lmdb
-    src: data/s2ef/200k/train/
+    src: /pscratch/sd/k/kabdelma/knowledge_distillation/s2ef
     key_mapping:
       y: energy
       force: forces
@@ -16,9 +16,14 @@ dataset:
           mean: 0
           stdev: 2.887317180633545
   val:
-    src: data/s2ef/all/val_id/
+    src:  /pscratch/sd/k/kabdelma/knowledge_distillation/s2ef
 
-logger: wandb
+  test:
+    src: /pscratch/sd/k/kabdelma/knowledge_distillation/s2ef
+
+logger:
+  name: wandb
+  project: eqv2-painn
 
 outputs:
   energy:

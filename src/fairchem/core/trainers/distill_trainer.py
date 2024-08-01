@@ -687,7 +687,7 @@ class DistillForcesTrainer(BaseTrainer):
             # weighting) before we do any computation if the relevant
             # parameter `loss_weighting_synthetic` cannot be found.
             w_per_node = torch.ones_like(batch[0].tags)
-            w_per_sample = torch.ones_like(batch[0].y)
+            w_per_sample = torch.ones_like(batch[0].energy)
 
             return w_per_node, w_per_sample
 
@@ -1052,7 +1052,7 @@ class DistillForcesTrainer(BaseTrainer):
                 if (
                     self.step % self.config["cmd"]["print_every"] == 0
                     and distutils.is_master()
-                    and not self.is_hpo
+                    # and not self.is_hpo
                 ):
                     log_str = [
                         "{}: {:.2e}".format(k, v) for k, v in log_dict.items()
@@ -1087,13 +1087,13 @@ class DistillForcesTrainer(BaseTrainer):
                             val_metrics,
                             disable_eval_tqdm=disable_eval_tqdm,
                         )
-                        if self.is_hpo:
-                            self.hpo_update(
-                                self.epoch,
-                                self.step,
-                                self.metrics,
-                                val_metrics,
-                            )
+                        # if self.is_hpo:
+                        #     self.hpo_update(
+                        #         self.epoch,
+                        #         self.step,
+                        #         self.metrics,
+                        #         val_metrics,
+                        #     )
 
                     if self.config["task"].get("eval_relaxations", False):
                         if "relax_dataset" not in self.config["task"]:
@@ -1193,7 +1193,7 @@ class DistillForcesTrainer(BaseTrainer):
                     out_per_atom_energy,
                 ],
                 _,
-            ) = self.model.extract_features(batch_list, main_graph)
+            ) = self.model.extract_features((batch_list, main_graph))
 
         else:
             [sfnode, sfn2e, sfvec], out_energy = self.model.extract_features(
@@ -1240,141 +1240,58 @@ class DistillForcesTrainer(BaseTrainer):
             t_out["forces"] = t_out_forces
         return {"out": out, "t_out": t_out}
 
-    def _compute_loss(self, out, batch_list, teacher_output=None):
+    def _compute_loss(self, out, batch, teacher_output=None):
+        batch_size = batch.natoms.numel()
+        fixed = batch.fixed
+        mask = fixed == 0
+
         loss = []
+        for loss_fn in self.loss_functions:
+            target_name, loss_info = loss_fn
 
-        # loss weighting setup
-        weight_per_node, weight_per_sample = self._loss_weights_d1M(
-            batch_list, loss_type="distill"
-        )
-        # undo squaring in MSE, if MSE is used
-        if self.loss_fn["energy"] == "mse":
-            weight_per_node = torch.sqrt(weight_per_node)
-        if self.loss_fn["force"] == "mse":
-            weight_per_sample = torch.sqrt(weight_per_sample)
+            target = batch[target_name]
+            pred = out[target_name]
 
-        # Energy loss.
-        if teacher_output is not None:
-            energy_target = teacher_output["energy"]
-        else:
-            energy_target = torch.cat(
-                [batch.y.to(self.device) for batch in batch_list], dim=0
-            )
-            if self.normalizer.get("normalize_labels", False):
-                energy_target = self.normalizers["target"].norm(energy_target)
+            natoms = batch.natoms
+            natoms = torch.repeat_interleave(natoms, natoms)
 
-        # loss weighting of energies based on the origin of the data
-        # these scaling factors can be factored out of the loss
-        out["energy"] *= weight_per_sample
-        energy_target *= weight_per_sample
+            if (
+                self.output_targets[target_name]["level"] == "atom"
+                and self.output_targets[target_name]["train_on_free_atoms"]
+            ):
+                target = target[mask]
+                pred = pred[mask]
+                natoms = natoms[mask]
 
-        energy_mult = self.config["optim"].get("energy_coefficient", 1)
-        loss.append(
-            energy_mult * self.loss_fn["energy"](out["energy"], energy_target)
-        )
-
-        # Force loss.
-        if self.config["model_attributes"].get("regress_forces", True):
-            if teacher_output is not None:
-                force_target = teacher_output["forces"]
+            num_atoms_in_batch = natoms.numel()
+            if self.normalizers.get(target_name, False):
+                target = self.normalizers[target_name].norm(target)
+            ### reshape accordingly: num_atoms_in_batch, -1 or num_systems_in_batch, -1
+            if self.output_targets[target_name]["level"] == "atom":
+                target = target.view(num_atoms_in_batch, -1)
+                pred = pred.view(num_atoms_in_batch, -1)
+                
             else:
-                force_target = torch.cat(
-                    [batch.force.to(self.device) for batch in batch_list],
-                    dim=0,
+                target = target.view(batch_size, -1)
+                pred = pred.view(batch_size, -1)
+            
+            
+            mult = loss_info["coefficient"]
+            loss.append(
+                mult
+                * loss_info["fn"](
+                    pred,
+                    target,
+                    natoms=natoms,
+                    batch_size=batch_size,
                 )
-                if self.normalizer.get("normalize_labels", False):
-                    force_target = self.normalizers["grad_target"].norm(
-                        force_target
-                    )
-
-            # loss weighting of forces based on the origin of the data
-            # these scaling factors can be factored out of the loss
-            out["forces"] *= weight_per_node[:, None]
-            force_target *= weight_per_node[:, None]
-
-            tag_specific_weights = self.config["task"].get(
-                "tag_specific_weights", []
             )
-            if tag_specific_weights != []:
-                # handle tag specific weights as introduced in forcenet
-                assert len(tag_specific_weights) == 3
-
-                batch_tags = torch.cat(
-                    [
-                        batch.tags.float().to(self.device)
-                        for batch in batch_list
-                    ],
-                    dim=0,
-                )
-                weight = torch.zeros_like(batch_tags)
-                weight[batch_tags == 0] = tag_specific_weights[0]
-                weight[batch_tags == 1] = tag_specific_weights[1]
-                weight[batch_tags == 2] = tag_specific_weights[2]
-
-                loss_force_list = torch.abs(out["forces"] - force_target)
-                train_loss_force_unnormalized = torch.sum(
-                    loss_force_list * weight.view(-1, 1)
-                )
-                train_loss_force_normalizer = 3.0 * weight.sum()
-
-                # add up normalizer to obtain global normalizer
-                distutils.all_reduce(train_loss_force_normalizer)
-
-                # perform loss normalization before backprop
-                train_loss_force_normalized = train_loss_force_unnormalized * (
-                    distutils.get_world_size() / train_loss_force_normalizer
-                )
-                loss.append(train_loss_force_normalized)
-
-            else:
-                # Force coefficient = 30 has been working well for us.
-                force_mult = self.config["optim"].get("force_coefficient", 30)
-                if self.config["task"].get("train_on_free_atoms", False):
-                    fixed = torch.cat(
-                        [batch.fixed.to(self.device) for batch in batch_list]
-                    )
-                    mask = fixed == 0
-                    if (
-                        self.config["optim"]
-                        .get("loss_force", "mae")
-                        .startswith("atomwise")
-                    ):
-                        force_mult = self.config["optim"].get(
-                            "force_coefficient", 1
-                        )
-                        natoms = torch.cat(
-                            [
-                                batch.natoms.to(self.device)
-                                for batch in batch_list
-                            ]
-                        )
-                        natoms = torch.repeat_interleave(natoms, natoms)
-                        force_loss = force_mult * self.loss_fn["force"](
-                            out["forces"][mask],
-                            force_target[mask],
-                            natoms=natoms[mask],
-                            batch_size=batch_list[0].natoms.shape[0],
-                        )
-                        loss.append(force_loss)
-                    else:
-                        loss.append(
-                            force_mult
-                            * self.loss_fn["force"](
-                                out["forces"][mask], force_target[mask]
-                            )
-                        )
-                else:
-                    loss.append(
-                        force_mult
-                        * self.loss_fn["force"](out["forces"], force_target)
-                    )
 
         # Sanity check to make sure the compute graph is correct.
         for lc in loss:
             assert hasattr(lc, "grad_fn")
 
-        loss = sum(loss)
-        return loss
+        return sum(loss)
 
     def _compute_loss_distill(self, out, batch_list, teacher_output=None):
         loss = []
@@ -1384,7 +1301,7 @@ class DistillForcesTrainer(BaseTrainer):
             energy_target = teacher_output["energy"]
         else:
             energy_target = torch.cat(
-                [batch.y.to(self.device) for batch in batch_list], dim=0
+                [batch.energy.to(self.device) for batch in batch_list], dim=0
             )
             if self.normalizer.get("normalize_labels", False):
                 energy_target = self.normalizers["target"].norm(energy_target)
@@ -1496,49 +1413,56 @@ class DistillForcesTrainer(BaseTrainer):
         loss = sum(loss)
         return loss
 
-    def _compute_metrics(self, out, batch_list, evaluator, metrics={}):
-        natoms = torch.cat(
-            [batch.natoms.to(self.device) for batch in batch_list], dim=0
-        )
+    def _compute_metrics(self, out, batch, evaluator, metrics=None):
+        if metrics is None:
+            metrics = {}
+        # this function changes the values in the out dictionary,
+        # make a copy instead of changing them in the callers version
+        out = {k: v.clone() for k, v in out.items()}
 
-        target = {
-            "energy": torch.cat(
-                [batch.y.to(self.device) for batch in batch_list], dim=0
-            ),
-            "forces": torch.cat(
-                [batch.force.to(self.device) for batch in batch_list], dim=0
-            ),
-            "natoms": natoms,
-        }
+        natoms = batch.natoms
+        batch_size = natoms.numel()
 
-        out["natoms"] = natoms
+        ### Retrieve free atoms
+        fixed = batch.fixed
+        mask = fixed == 0
 
-        if self.config["task"].get("eval_on_free_atoms", True):
-            fixed = torch.cat(
-                [batch.fixed.to(self.device) for batch in batch_list]
-            )
-            mask = fixed == 0
-            out["forces"] = out["forces"][mask]
-            target["forces"] = target["forces"][mask]
+        s_idx = 0
+        natoms_free = []
+        for _natoms in natoms:
+            natoms_free.append(torch.sum(mask[s_idx : s_idx + _natoms]).item())
+            s_idx += _natoms
+        natoms = torch.LongTensor(natoms_free).to(self.device)
 
-            s_idx = 0
-            natoms_free = []
-            for natoms in target["natoms"]:
-                natoms_free.append(
-                    torch.sum(mask[s_idx : s_idx + natoms]).item()
+        targets = {}
+        for target_name in self.output_targets:
+            target = batch[target_name]
+            num_atoms_in_batch = batch.natoms.sum()
+
+            if (
+                self.output_targets[target_name]["level"] == "atom"
+                and self.output_targets[target_name]["eval_on_free_atoms"]
+            ):
+                target = target[mask]
+                out[target_name] = out[target_name][mask]
+                num_atoms_in_batch = natoms.sum()
+            ### reshape accordingly: num_atoms_in_batch, -1 or num_systems_in_batch, -1
+            if self.output_targets[target_name]["level"] == "atom":
+                target = target.view(num_atoms_in_batch, -1)
+                out[target_name] = out[target_name].view(num_atoms_in_batch, -1)
+            else:
+                target = target.view(batch_size, -1)
+                out[target_name] = out[target_name].view(batch_size, -1)
+
+            targets[target_name] = target
+            if self.normalizers.get(target_name, False):
+                out[target_name] = self.normalizers[target_name].denorm(
+                    out[target_name]
                 )
-                s_idx += natoms
-            target["natoms"] = torch.LongTensor(natoms_free).to(self.device)
-            out["natoms"] = torch.LongTensor(natoms_free).to(self.device)
 
-        if self.normalizer.get("normalize_labels", False):
-            out["energy"] = self.normalizers["target"].denorm(out["energy"])
-            out["forces"] = self.normalizers["grad_target"].denorm(
-                out["forces"]
-            )
-
-        metrics = evaluator.eval(out, target, prev_metrics=metrics)
-        return metrics
+        targets["natoms"] = natoms
+        out["natoms"] = natoms
+        return evaluator.eval(out, targets, prev_metrics=metrics)
 
     def run_relaxations(self, split="val"):
         logging.info("Running ML-relaxations")

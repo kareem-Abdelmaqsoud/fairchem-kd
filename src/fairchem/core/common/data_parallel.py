@@ -351,9 +351,9 @@ class OCPDataParallel(torch.nn.DataParallel):
         return self.gather(outputs, self.output_device)
 
     def extract_features(self, batch_list, main_graph=None):
-        import pdb; pdb.set_trace()
         if self.cpu:
-            return self.module.extract_features((batch_list[0], main_graph))
+            return self.module.extract_features((batch_list, main_graph))
+            # return self.module.extract_features((batch_list[0], main_graph))
 
         if len(self.device_ids) == 1:
             return self.module.extract_features(

@@ -524,7 +524,6 @@ class PaiNN(BaseModel):
 
         if self.regress_forces and not self.direct_forces:
             pos = pos.requires_grad_(True)
-
         if main_graph is None:
             (
                 edge_index,
@@ -532,7 +531,7 @@ class PaiNN(BaseModel):
                 edge_dist,
                 edge_vector,
                 id_swap,
-            ) = self.generate_graph(data)
+            ) = self.generate_graph_values(data)
         else:
             edge_index = main_graph["edge_index"]
             edge_dist = main_graph["distance"]

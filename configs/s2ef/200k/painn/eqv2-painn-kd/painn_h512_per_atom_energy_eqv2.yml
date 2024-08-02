@@ -1,5 +1,5 @@
 includes:
-  - configs/s2ef/200k/painn/painn_h512.yml
+  - configs/s2ef/200k/painn/eqv2-painn-kd/painn_h512.yml
 trainer: distill
 
 distillation:

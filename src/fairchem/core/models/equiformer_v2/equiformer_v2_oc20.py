@@ -6,6 +6,7 @@ import math
 
 import torch
 import torch.nn as nn
+from torch_scatter import scatter
 
 from fairchem.core.common import gp_utils
 from fairchem.core.common.registry import registry
@@ -713,18 +714,16 @@ class EquiformerV2_OC20(BaseModel):
     
     def extract_features(self, data_and_graph):
         data = data_and_graph[0]
-        batch_size = len(data.natoms)
-        dtype = data.pos.dtype
-        device = data.pos.device
-
+        self.batch_size = len(data.natoms)
+        self.dtype = data.pos.dtype
+        self.device = data.pos.device
         atomic_numbers = data.atomic_numbers.long()
-        num_atoms = len(atomic_numbers)
-
-
+        
         main_graph = self.generate_graph(
             data,
-            enforce_max_neighbors_strictly = self.enforce_max_neighbors_strictly,
+            enforce_max_neighbors_strictly=self.enforce_max_neighbors_strictly,
         )
+        
         (
             edge_index,
             edge_distance,
@@ -733,7 +732,26 @@ class EquiformerV2_OC20(BaseModel):
             _,  # cell offset distances
             neighbors,
         ) = main_graph
-        _, idx_t = edge_index
+
+        data_batch_full = data.batch
+        data_batch = data.batch
+        atomic_numbers_full = atomic_numbers
+        node_offset = 0
+        if gp_utils.initialized():
+            (
+                atomic_numbers,
+                data_batch,
+                node_offset,
+                edge_index,
+                edge_distance,
+                edge_distance_vec,
+            ) = self._init_gp_partitions(
+                atomic_numbers_full,
+                data_batch_full,
+                edge_index,
+                edge_distance,
+                edge_distance_vec,
+            )
         ###############################################################
         # Initialize data structures
         ###############################################################
@@ -752,12 +770,13 @@ class EquiformerV2_OC20(BaseModel):
         # Init per node representations using an atomic number based embedding
         offset = 0
         x = SO3_Embedding(
-            num_atoms,
+            len(atomic_numbers),
             self.lmax_list,
             self.sphere_channels,
-            device,
-            dtype,
+            self.device,
+            self.dtype,
         )
+
         offset_res = 0
         offset = 0
         # Initialize the l = 0, m = 0 coefficients for each resolution
@@ -770,34 +789,44 @@ class EquiformerV2_OC20(BaseModel):
                 ]
             offset = offset + self.sphere_channels
             offset_res = offset_res + int((self.lmax_list[i] + 1) ** 2)
-        
+
         # Edge encoding (distance and atom edge)
         edge_distance = self.distance_expansion(edge_distance)
         if self.share_atom_edge_embedding and self.use_atom_edge_embedding:
-            source_element = atomic_numbers[edge_index[0]]  # Source atom atomic number
-            target_element = atomic_numbers[edge_index[1]]  # Target atom atomic number
+            source_element = atomic_numbers_full[
+                edge_index[0]
+            ]  # Source atom atomic number
+            target_element = atomic_numbers_full[
+                edge_index[1]
+            ]  # Target atom atomic number
             source_embedding = self.source_embedding(source_element)
             target_embedding = self.target_embedding(target_element)
             edge_distance = torch.cat(
                 (edge_distance, source_embedding, target_embedding), dim=1
             )
-        
+            
         # Edge-degree embedding
         edge_degree = self.edge_degree_embedding(
-            atomic_numbers, edge_distance, edge_index
+            atomic_numbers_full,
+            edge_distance,
+            edge_index,
+            len(atomic_numbers),
+            node_offset,
         )
         x.embedding = x.embedding + edge_degree.embedding
 
         ###############################################################
         # Update spherical node embeddings
         ###############################################################
+
         for i in range(self.num_layers):
             x = self.blocks[i](
                 x,  # SO3_Embedding
-                atomic_numbers,
+                atomic_numbers_full,
                 edge_distance,
                 edge_index,
-                batch=data.batch,  # for GraphDropPath
+                batch=data_batch,  # for GraphDropPath
+                node_offset=node_offset,
             )
 
         # Final layer norm
@@ -811,21 +840,22 @@ class EquiformerV2_OC20(BaseModel):
                 self.n2n_mapping(node_embedding),
                 self.e2e_mapping(edge_distance),
             ]
-        
+            
+        _, idx_t = edge_index
         with torch.cuda.amp.autocast(False):
             m2h = scatter(
                 features_to_distill[1].float(),
                 idx_t,
                 dim=0,
-                dim_size=num_atoms,
+                dim_size=len(atomic_numbers),
                 reduce=self.distill_reduce,
             )
             m2v = scatter(
                 features_to_distill[1].float().unsqueeze(1)
-                * main_graph[2].unsqueeze(-1),
+                * edge_distance_vec.unsqueeze(-1),
                 idx_t,
                 dim=0,
-                dim_size=num_atoms,
+                dim_size=len(atomic_numbers),
                 reduce=self.distill_reduce,
             )
         with torch.cuda.amp.autocast(False):
@@ -841,23 +871,58 @@ class EquiformerV2_OC20(BaseModel):
         ###############################################################
         node_energy = self.energy_block(x)
         node_energy = node_energy.embedding.narrow(1, 0, 1)
+        if gp_utils.initialized():
+            node_energy = gp_utils.gather_from_model_parallel_region(node_energy, dim=0)
         energy = torch.zeros(
             len(data.natoms),
             device=node_energy.device,
             dtype=node_energy.dtype,
         )
-        energy.index_add_(0, data.batch, node_energy.view(-1))
+        energy.index_add_(0, data_batch_full, node_energy.view(-1))
         energy = energy / self.avg_num_nodes
+
+        # Add the per-atom linear references to the energy.
+        if self.use_energy_lin_ref and self.load_energy_lin_ref:
+            # During training, target E = (E_DFT - E_ref - E_mean) / E_std, and
+            # during inference, \hat{E_DFT} = \hat{E} * E_std + E_ref + E_mean
+            # where
+            #
+            # E_DFT = raw DFT energy,
+            # E_ref = reference energy,
+            # E_mean = normalizer mean,
+            # E_std = normalizer std,
+            # \hat{E} = predicted energy,
+            # \hat{E_DFT} = predicted DFT energy.
+            #
+            # We can also write this as
+            # \hat{E_DFT} = E_std * (\hat{E} + E_ref / E_std) + E_mean,
+            # which is why we save E_ref / E_std as the linear reference.
+            with torch.cuda.amp.autocast(False):
+                energy = energy.to(self.energy_lin_ref.dtype).index_add(
+                    0,
+                    data_batch_full,
+                    self.energy_lin_ref[atomic_numbers_full],
+                )
+
         outputs = {"energy": energy}
 
         ###############################################################
         # Force estimation
         ###############################################################
         if self.regress_forces:
-            forces = self.force_block(x, atomic_numbers, edge_distance, edge_index)
+            forces = self.force_block(
+                x,
+                atomic_numbers_full,
+                edge_distance,
+                edge_index,
+                node_offset=node_offset,
+            )
             forces = forces.embedding.narrow(1, 1, 3)
-            forces = forces.view(-1, 3)
+            forces = forces.view(-1, 3).contiguous()
+            if gp_utils.initialized():
+                forces = gp_utils.gather_from_model_parallel_region(forces, dim=0)
             outputs["forces"] = forces
+            
         return (
                 features_to_distill,
                 [outputs["energy"], outputs["forces"], node_energy.view(-1)],

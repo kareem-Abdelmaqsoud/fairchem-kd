@@ -335,7 +335,6 @@ class DistillForcesTrainer(BaseTrainer):
             new_dict = {
                 f"module.{k}": v for k, v in checkpoint["state_dict"].items()
             }
-            # import pdb; pdb.set_trace()            
             self.teacher.load_state_dict(new_dict,)
         else:
             self.teacher.load_state_dict(checkpoint["state_dict"])
@@ -604,7 +603,6 @@ class DistillForcesTrainer(BaseTrainer):
                 delta=self.huber_delta,
             )
         else:
-            # import pdb; pdb.set_trace()
             return torch.nn.functional.mse_loss(
                 out_batch["out"]["node_feature"],
                 out_batch["t_out"]["node_feature"],

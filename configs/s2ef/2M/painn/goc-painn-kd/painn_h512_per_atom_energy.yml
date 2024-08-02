@@ -1,0 +1,5 @@
+includes:
+  - configs/s2ef/2M/painn/goc-painn-kd/painn_base_distill.yml
+distillation:
+  distill_loss: per_atom_energy_distill_loss
+  distill_lambda: 100.0

@@ -29,9 +29,10 @@ from fairchem.core.common.data_parallel import (
     ParallelCollater,
 )
 from fairchem.core.common.registry import registry
+from fairchem.core.modules.scaling.util import ensure_fitted
 from fairchem.core.common.relaxation.ml_relaxation import ml_relax
 from fairchem.core.common.transforms import AddNoise, RandomJitter
-from fairchem.core.common.utils import check_traj_files
+from fairchem.core.common.utils import check_traj_files, irreps_sum, cg_change_mat
 from fairchem.core.modules.evaluator import Evaluator
 from fairchem.core.modules.normalizer import Normalizer
 from fairchem.core.trainers.base_trainer import BaseTrainer
@@ -344,10 +345,15 @@ class DistillForcesTrainer(BaseTrainer):
     def predict(
         self,
         data_loader,
-        per_image=True,
-        results_file=None,
-        disable_tqdm=False,
+        per_image: bool = True,
+        results_file: str | None = None,
+        disable_tqdm: bool = False,
     ):
+        if self.is_debug and per_image:
+            raise FileNotFoundError("Predictions require debug mode to be turned off.")
+
+        ensure_fitted(self._unwrapped_model, warn=True)
+
         if distutils.is_master() and not disable_tqdm:
             logging.info("Predicting on test.")
         assert isinstance(
@@ -360,94 +366,106 @@ class DistillForcesTrainer(BaseTrainer):
         rank = distutils.get_rank()
 
         if isinstance(data_loader, torch_geometric.data.Batch):
-            data_loader = [[data_loader]]
+            data_loader = [data_loader]
 
         self.model.eval()
-        if self.ema:
+        if self.ema is not None:
             self.ema.store()
             self.ema.copy_to()
 
-        if self.normalizers is not None and "target" in self.normalizers:
-            self.normalizers["target"].to(self.device)
-            self.normalizers["grad_target"].to(self.device)
+        predictions = defaultdict(list)
 
-        predictions = {"id": [], "energy": [], "forces": [], "chunk_idx": []}
-
-        for i, batch_list in tqdm(
+        for _i, batch in tqdm(
             enumerate(data_loader),
             total=len(data_loader),
             position=rank,
-            desc="device {}".format(rank),
+            desc=f"device {rank}",
             disable=disable_tqdm,
         ):
             with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-                out = self._forward(batch_list)
+                out = self._forward(batch)
 
-            if self.normalizers is not None and "target" in self.normalizers:
-                out["energy"] = self.normalizers["target"].denorm(
-                    out["energy"]
-                )
-                out["forces"] = self.normalizers["grad_target"].denorm(
-                    out["forces"]
-                )
-            if per_image:
-                systemids = [
-                    str(i) + "_" + str(j)
-                    for i, j in zip(
-                        batch_list[0].sid.tolist(), batch_list[0].fid.tolist()
-                    )
-                ]
-                predictions["id"].extend(systemids)
-                predictions["energy"].extend(
-                    out["energy"].to(torch.float16).tolist()
-                )
-                batch_natoms = torch.cat(
-                    [batch.natoms for batch in batch_list]
-                )
-                batch_fixed = torch.cat([batch.fixed for batch in batch_list])
-                forces = out["forces"].cpu().detach().to(torch.float16)
-                per_image_forces = torch.split(forces, batch_natoms.tolist())
-                per_image_forces = [
-                    force.numpy() for force in per_image_forces
-                ]
-                # evalAI only requires forces on free atoms
-                if results_file is not None:
-                    _per_image_fixed = torch.split(
-                        batch_fixed, batch_natoms.tolist()
-                    )
-                    _per_image_free_forces = [
-                        force[(fixed == 0).tolist()]
-                        for force, fixed in zip(
-                            per_image_forces, _per_image_fixed
+            for target_key in self.config["outputs"]:
+                pred = out[target_key]
+                if self.normalizers.get(target_key, False):
+                    pred = self.normalizers[target_key].denorm(pred)
+
+                if per_image:
+                    ### Save outputs in desired precision, default float16
+                    if (
+                        self.config["outputs"][target_key].get(
+                            "prediction_dtype", "float16"
                         )
-                    ]
-                    _chunk_idx = np.array(
-                        [
-                            free_force.shape[0]
-                            for free_force in _per_image_free_forces
+                        == "float32"
+                        or self.config["task"].get("prediction_dtype", "float16")
+                        == "float32"
+                        or self.config["task"].get("dataset", "lmdb") == "oc22_lmdb"
+                    ):
+                        dtype = torch.float32
+                    else:
+                        dtype = torch.float16
+
+                    pred = pred.cpu().detach().to(dtype)
+                    ### Split predictions into per-image predictions
+                    if self.config["outputs"][target_key]["level"] == "atom":
+                        batch_natoms = batch.natoms
+                        batch_fixed = batch.fixed
+                        per_image_pred = torch.split(pred, batch_natoms.tolist())
+
+                        ### Save out only free atom, EvalAI does not need fixed atoms
+                        _per_image_fixed = torch.split(
+                            batch_fixed, batch_natoms.tolist()
+                        )
+                        _per_image_free_preds = [
+                            _pred[(fixed == 0).tolist()].numpy()
+                            for _pred, fixed in zip(per_image_pred, _per_image_fixed)
                         ]
-                    )
-                    per_image_forces = _per_image_free_forces
-                    predictions["chunk_idx"].extend(_chunk_idx)
-                predictions["forces"].extend(per_image_forces)
-            else:
-                predictions["energy"] = out["energy"].detach()
-                predictions["forces"] = out["forces"].detach()
+                        _chunk_idx = np.array(
+                            [free_pred.shape[0] for free_pred in _per_image_free_preds]
+                        )
+                        per_image_pred = _per_image_free_preds
+                    ### Assumes system level properties are of the same dimension
+                    else:
+                        per_image_pred = pred.numpy()
+                        _chunk_idx = None
+
+                    predictions[f"{target_key}"].extend(per_image_pred)
+                    ### Backwards compatibility, retain 'chunk_idx' for forces.
+                    if _chunk_idx is not None:
+                        if target_key == "forces":
+                            predictions["chunk_idx"].extend(_chunk_idx)
+                        else:
+                            predictions[f"{target_key}_chunk_idx"].extend(_chunk_idx)
+                else:
+                    predictions[f"{target_key}"] = pred.detach()
+
+            if not per_image:
                 return predictions
 
-        predictions["forces"] = np.array(predictions["forces"])
-        predictions["chunk_idx"] = np.array(predictions["chunk_idx"])
-        predictions["energy"] = np.array(predictions["energy"])
-        predictions["id"] = np.array(predictions["id"])
-        self.save_results(
-            predictions, results_file, keys=["energy", "forces", "chunk_idx"]
-        )
+            ### Get unique system identifiers
+            sids = (
+                batch.sid.tolist() if isinstance(batch.sid, torch.Tensor) else batch.sid
+            )
+            ## Support naming structure for OC20 S2EF
+            if "fid" in batch:
+                fids = (
+                    batch.fid.tolist()
+                    if isinstance(batch.fid, torch.Tensor)
+                    else batch.fid
+                )
+                systemids = [f"{sid}_{fid}" for sid, fid in zip(sids, fids)]
+            else:
+                systemids = [f"{sid}" for sid in sids]
+
+            predictions["ids"].extend(systemids)
+
+        self.save_results(predictions, results_file)
 
         if self.ema:
             self.ema.restore()
 
         return predictions
-
+    
     def update_best(
         self,
         primary_metric,
@@ -533,7 +551,7 @@ class DistillForcesTrainer(BaseTrainer):
             feat_t_distances = torch.mean(feat_t_distances, dim=1)
         dist = F.mse_loss(feat_s_distances, feat_t_distances, reduction="none")
         loss = scatter(dist, index1, dim=0, reduce="mean")
-        loss = scatter(loss, batch_list[0].batch, dim=0, reduce="mean")
+        loss = scatter(loss, batch_list.batch, dim=0, reduce="mean")
         return torch.mean(loss)
 
     def _local_preservation(self, feat_s, feat_t, edge_index):
@@ -1121,23 +1139,60 @@ class DistillForcesTrainer(BaseTrainer):
             self.test_dataset.close_db()
 
     def _forward(self, batch_list):
-        # forward pass.
-        if self.config["model_attributes"].get("regress_forces", True):
-            out_energy, out_forces = self.model(batch_list)
-        else:
-            out_energy = self.model(batch_list)
+        out = self.model(batch_list.to(self.device))
 
-        if out_energy.shape[-1] == 1:
-            out_energy = out_energy.view(-1)
+        ### TODO: Move into BaseModel in OCP 2.0
+        outputs = {}
+        batch_size = batch_list.natoms.numel()
+        num_atoms_in_batch = batch_list.natoms.sum()
+        for target_key in self.output_targets:
+            ### Target property is a direct output of the model
+            if target_key in out:
+                pred = out[target_key]
+            ## Target property is a derived output of the model. Construct the
+            ## parent property
+            else:
+                _max_rank = 0
+                for subtarget_key in self.output_targets[target_key]["decomposition"]:
+                    _max_rank = max(
+                        _max_rank,
+                        self.output_targets[subtarget_key]["irrep_dim"],
+                    )
 
-        out = {
-            "energy": out_energy,
-        }
+                pred_irreps = torch.zeros(
+                    (batch_size, irreps_sum(_max_rank)), device=self.device
+                )
 
-        if self.config["model_attributes"].get("regress_forces", True):
-            out["forces"] = out_forces
+                for subtarget_key in self.output_targets[target_key]["decomposition"]:
+                    irreps = self.output_targets[subtarget_key]["irrep_dim"]
+                    _pred = out[subtarget_key]
 
-        return out
+                    if self.normalizers.get(subtarget_key, False):
+                        _pred = self.normalizers[subtarget_key].denorm(_pred)
+
+                    ## Fill in the corresponding irreps prediction
+                    ## Reshape irrep prediction to (batch_size, irrep_dim)
+                    pred_irreps[
+                        :,
+                        max(0, irreps_sum(irreps - 1)) : irreps_sum(irreps),
+                    ] = _pred.view(batch_size, -1)
+
+                pred = torch.einsum(
+                    "ba, cb->ca",
+                    cg_change_mat(_max_rank, self.device),
+                    pred_irreps,
+                )
+
+            ### not all models are consistent with the output shape
+            ### reshape accordingly: num_atoms_in_batch, -1 or num_systems_in_batch, -1
+            if self.output_targets[target_key]["level"] == "atom":
+                pred = pred.view(num_atoms_in_batch, -1)
+            else:
+                pred = pred.view(batch_size, -1)
+
+            outputs[target_key] = pred
+
+        return outputs
 
     def _distill_forward_energy_forces_only(self, batch_list):
         # forward pass.
@@ -1388,7 +1443,7 @@ class DistillForcesTrainer(BaseTrainer):
                             out["forces"][mask],
                             force_target[mask],
                             natoms=natoms[mask],
-                            batch_size=batch_list[0].natoms.shape[0],
+                            batch_size=batch_list.natoms.shape[0],
                         )
                         loss.append(force_loss)
                     else:

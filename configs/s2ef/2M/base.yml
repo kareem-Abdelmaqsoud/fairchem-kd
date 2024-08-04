@@ -18,9 +18,6 @@ dataset:
   val:
     src: /home/jovyan/shared-scratch/kabdelma/knowledge_distillation/lmdbs/val_5k
 
-  test:
-    src: /home/jovyan/shared-scratch/kabdelma/knowledge_distillation/lmdbs/val_5k
-
 logger: wandb
 
 outputs:

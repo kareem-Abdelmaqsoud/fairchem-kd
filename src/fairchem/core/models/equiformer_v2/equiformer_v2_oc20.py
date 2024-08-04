@@ -158,6 +158,8 @@ class EquiformerV2_OC20(BaseModel):
         teacher_edge_dim: int = 512,
         use_distill: bool = False,
         id_mapping: bool = False,
+        edge_distill_method: int = 0,
+        vector_distill_method: int = 0,
     ):
         if mmax_list is None:
             mmax_list = [2]
@@ -194,7 +196,9 @@ class EquiformerV2_OC20(BaseModel):
 
         self.num_sphere_samples = num_sphere_samples
         
-        # distillation: mapping different embeddings of the teacher and the student models 
+        # distillation: mapping different embeddings of the teacher and the student models
+        self.edge_distill_method = edge_distill_method
+        self.vector_distill_method = vector_distill_method
         if use_distill and not id_mapping:
             self.n2n_mapping = nn.Linear(sphere_channels, teacher_node_dim)
             self.e2e_mapping = nn.Linear(600, teacher_edge_dim)
@@ -831,41 +835,7 @@ class EquiformerV2_OC20(BaseModel):
 
         # Final layer norm
         x.embedding = self.norm(x.embedding)
-
-        features_to_distill = None
-        if features_to_distill is None:
-            ## pick l=0 and m=0 spherical hamonics because it is invariant 
-            node_embedding = x.embedding[:,0,:]
-            features_to_distill = [
-                self.n2n_mapping(node_embedding),
-                self.e2e_mapping(edge_distance),
-            ]
-            
-        _, idx_t = edge_index
-        with torch.cuda.amp.autocast(False):
-            m2h = scatter(
-                features_to_distill[1].float(),
-                idx_t,
-                dim=0,
-                dim_size=len(atomic_numbers),
-                reduce=self.distill_reduce,
-            )
-            m2v = scatter(
-                features_to_distill[1].float().unsqueeze(1)
-                * edge_distance_vec.unsqueeze(-1),
-                idx_t,
-                dim=0,
-                dim_size=len(atomic_numbers),
-                reduce=self.distill_reduce,
-            )
-        with torch.cuda.amp.autocast(False):
-            features_to_distill = [
-                features_to_distill[0].float(),
-                m2h.float(),
-                m2v.float(),
-                features_to_distill[1].float(),
-            ]
-
+        
         ###############################################################
         # Energy estimation
         ###############################################################
@@ -917,11 +887,80 @@ class EquiformerV2_OC20(BaseModel):
                 edge_index,
                 node_offset=node_offset,
             )
+            # [n_edges, 29, 128]
+            # unrotated_embedding = forces.unrotated_embedding
+            rotated_embedding = forces.rotated_embedding
+            # [n_nodes, 49, 1] >> [n_nodes, 3, 1]
             forces = forces.embedding.narrow(1, 1, 3)
             forces = forces.view(-1, 3).contiguous()
             if gp_utils.initialized():
                 forces = gp_utils.gather_from_model_parallel_region(forces, dim=0)
             outputs["forces"] = forces
+
+        ###############################################################
+        # Distillation
+        ###############################################################
+        features_to_distill = None    
+        if features_to_distill is None:
+            ## pick l=0 and m=0 spherical hamonics because it is invariant to rotations 
+            # and is expected has the most information for energy prediction
+            node_embedding = x.embedding[:,0,:]
+            edge_embedding = rotated_embedding
+            features_to_distill = [
+                self.n2n_mapping(node_embedding),
+                self.e2e_mapping(edge_embedding),
+            ]
+
+        # import pdb; pdb.set_trace()
+        _, idx_t = edge_index
+        with torch.cuda.amp.autocast(False):
+            if self.edge_distill_method == 0:
+                # get edge scalar features using l=0 and m=0 channel
+                m2h = scatter(
+                    features_to_distill[1][:,0,:].float(),
+                    idx_t,
+                    dim=0,
+                    dim_size=len(atomic_numbers),
+                    reduce=self.distill_reduce,
+                )
+            else:
+                # get edge scalar features using l=1 and m=0 channel
+                m2h = scatter(
+                    features_to_distill[1][:,1,:].float(),
+                    idx_t,
+                    dim=0,
+                    dim_size=len(atomic_numbers),
+                    reduce=self.distill_reduce,
+                )
+
+            # get edge vector features
+            if self.vector_distill_method == 0:
+                ## method #1: take the l=0 channel similar to Gemnet-oc implementation
+                m2v = scatter(
+                    features_to_distill[1][:,0,:].float().unsqueeze(1)
+                    * main_graph[2].unsqueeze(-1),
+                    idx_t,
+                    dim=0,
+                    dim_size=len(atomic_numbers),
+                    reduce=self.distill_reduce,
+                )
+            else:
+                # method #2 similar to how forces are obtained you take l=1 channels
+                m2v = scatter(
+                    features_to_distill[1].narrow(1, 1, 3).float(),
+                    idx_t,
+                    dim=0,
+                    dim_size=len(atomic_numbers),
+                    reduce=self.distill_reduce,
+                )
+
+        with torch.cuda.amp.autocast(False):
+            features_to_distill = [
+                features_to_distill[0].float(),
+                m2h.float(),
+                m2v.float(),
+                features_to_distill[1].float(),
+            ]
             
         return (
                 features_to_distill,

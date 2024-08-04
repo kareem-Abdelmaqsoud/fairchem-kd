@@ -1,21 +1,10 @@
 includes:
-  - configs/s2ef/200k/painn/painn_h512.yml
-trainer: distill
+  - configs/s2ef/2M/base.yml
+
+trainer: equiformerv2_forces
 
 model:
-  use_distill: True
-  teacher_node_dim: 128
-  teacher_edge_dim: 128
-
-  
-
-teacher_path: /home/jovyan/shared-scratch/kabdelma/knowledge_distillation/pretrained/eq2_83M_2M.pt
-teacher_model:
   name: equiformer_v2
-
-  ## change the distillation method for edges
-  edge_distill_method: 0
-  vector_distill_method: 0
 
   use_pbc:                  True
   regress_forces:           True
@@ -33,7 +22,7 @@ teacher_model:
   ffn_hidden_channels:      128
   norm_type:                'layer_norm_sh'    # ['rms_norm_sh', 'layer_norm', 'layer_norm_sh']
 
-  lmax_list:                [6]
+  lmax_list:                [2]
   mmax_list:                [2]
   grid_resolution:          18              # [18, 16, 14, None] For `None`, simply comment this line.
 
@@ -59,3 +48,25 @@ teacher_model:
 
   weight_init:              'uniform'    # ['uniform', 'normal']
 
+optim:
+  batch_size:                   4         # 6
+  eval_batch_size:              4         # 6
+  load_balancing: atoms
+  num_workers: 8
+  lr_initial:                   0.0004    # [0.0002, 0.0004], eSCN uses 0.0008 for batch size 96
+
+  optimizer: AdamW
+  optimizer_params:
+    weight_decay: 0.001
+  scheduler: LambdaLR
+  scheduler_params:
+    lambda_type: cosine
+    warmup_factor: 0.2
+    warmup_epochs: 0.1
+    lr_min_factor: 0.01         #
+
+  max_epochs: 30
+  clip_grad_norm: 100
+  ema_decay: 0.999
+
+  eval_every: 5000

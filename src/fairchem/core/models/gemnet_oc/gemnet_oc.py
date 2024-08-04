@@ -1376,7 +1376,6 @@ class GemNetOC(BaseModel):
 
         if self.regress_forces and not self.direct_forces:
             pos.requires_grad_(True)
-
         (
             main_graph,
             a2a_graph,

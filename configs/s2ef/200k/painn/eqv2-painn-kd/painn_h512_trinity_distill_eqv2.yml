@@ -3,9 +3,9 @@ includes:
 trainer: distill
 distillation:
   distill_loss: node2node_distill_loss,edge2node_distill_loss,vec2vec_distill_loss 
-  distill_lambda: [100.0, 0.05, 1.0]
+  distill_lambda: [1000.0, 5000.0, 50000.0]
 
 model:
   use_distill: True
   teacher_node_dim: 128
-  teacher_edge_dim: 512
+  teacher_edge_dim: 128

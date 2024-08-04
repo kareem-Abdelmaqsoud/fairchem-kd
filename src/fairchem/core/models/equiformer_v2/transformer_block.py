@@ -352,14 +352,27 @@ class SO2EquivariantGraphAttention(torch.nn.Module):
         )
         x_message.embedding = attn
 
+        # get the unrotated embedding
+        unrotated_embedding = x_message.embedding.detach()
+
         # Rotate back the irreps
         x_message._rotate_inv(self.SO3_rotation, self.mappingReduced)
+
+        # get the unrotated embedding
+        rotated_embedding = x_message.embedding.detach()
 
         # Compute the sum of the incoming neighboring messages for each target node
         x_message._reduce_edge(edge_index[1] - node_offset, len(x.embedding))
 
         # Project
-        return self.proj(x_message)
+        out_embedding = self.proj(x_message)
+
+
+        # store the unrotated embedding in the output_embedding
+        out_embedding.unrotated_embedding = unrotated_embedding
+        out_embedding.rotated_embedding = rotated_embedding
+
+        return out_embedding
 
 
 class FeedForwardNetwork(torch.nn.Module):

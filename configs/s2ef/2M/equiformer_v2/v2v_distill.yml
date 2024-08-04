@@ -1,5 +1,5 @@
 includes:
-  - configs/s2ef/2M/painn/eqv2-painn-kd/painn_base_distill_eqv2.yml
+  - configs/s2ef/2M/equiformer_v2/base_distill.yml
 trainer: distill
 distillation:
   distill_loss: vec2vec_distill_loss 

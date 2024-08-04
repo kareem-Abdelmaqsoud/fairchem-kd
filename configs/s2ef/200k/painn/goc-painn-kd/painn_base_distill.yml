@@ -8,7 +8,7 @@ model:
   teacher_edge_dim: 512
   
 
-teacher_path: /pscratch/sd/k/kabdelma/pretrained_models/gemnet_oc_base_s2ef_2M.pt
+teacher_path: /home/jovyan/shared-scratch/kabdelma/knowledge_distillation/pretrained/gemnet_oc_base_s2ef_2M.pt
 teacher_model:
   name: gemnet_oc
   num_spherical: 7

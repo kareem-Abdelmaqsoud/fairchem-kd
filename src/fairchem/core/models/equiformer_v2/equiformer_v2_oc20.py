@@ -152,7 +152,7 @@ class EquiformerV2_OC20(BaseModel):
         avg_degree: float | None = None,
         use_energy_lin_ref: bool | None = False,
         load_energy_lin_ref: bool | None = False,
-                distill_reduce: str = "sum",
+        distill_reduce: str = "sum",
         distill_layer_code: str = "concatmlp",
         teacher_node_dim: int = 128,
         teacher_edge_dim: int = 512,
@@ -201,7 +201,7 @@ class EquiformerV2_OC20(BaseModel):
         self.vector_distill_method = vector_distill_method
         if use_distill and not id_mapping:
             self.n2n_mapping = nn.Linear(sphere_channels, teacher_node_dim)
-            self.e2e_mapping = nn.Linear(600, teacher_edge_dim)
+            self.e2e_mapping = nn.Linear(sphere_channels, teacher_edge_dim)
         else:
             self.n2n_mapping = nn.Identity()
             self.e2e_mapping = nn.Identity()
@@ -900,18 +900,17 @@ class EquiformerV2_OC20(BaseModel):
         ###############################################################
         # Distillation
         ###############################################################
-        features_to_distill = None    
+        features_to_distill = None 
         if features_to_distill is None:
             ## pick l=0 and m=0 spherical hamonics because it is invariant to rotations 
             # and is expected has the most information for energy prediction
-            node_embedding = x.embedding[:,0,:]
+            node_embedding = x.embedding
             edge_embedding = rotated_embedding
             features_to_distill = [
                 self.n2n_mapping(node_embedding),
                 self.e2e_mapping(edge_embedding),
             ]
 
-        # import pdb; pdb.set_trace()
         _, idx_t = edge_index
         with torch.cuda.amp.autocast(False):
             if self.edge_distill_method == 0:

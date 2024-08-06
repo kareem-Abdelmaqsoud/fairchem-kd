@@ -18,7 +18,9 @@ dataset:
   val:
     src: /home/jovyan/shared-scratch/kabdelma/knowledge_distillation/lmdbs/val_5k
 
-logger: wandb
+logger:
+  name: wandb
+  project: eqv2-painn
 
 outputs:
   energy:

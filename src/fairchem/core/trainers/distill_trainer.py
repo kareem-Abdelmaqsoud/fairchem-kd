@@ -36,6 +36,7 @@ from fairchem.core.common.utils import check_traj_files, irreps_sum, cg_change_m
 from fairchem.core.modules.evaluator import Evaluator
 from fairchem.core.modules.normalizer import Normalizer
 from fairchem.core.trainers.base_trainer import BaseTrainer
+from fairchem.core.models.equiformer_v2.trainers.forces_trainer import EquiformerV2ForcesTrainer
 
 
 def vector_projection(vec1, vec2):
@@ -97,7 +98,7 @@ def cka(X, Y):
 
 
 @registry.register_trainer("distill")
-class DistillForcesTrainer(BaseTrainer):
+class DistillForcesTrainer(EquiformerV2ForcesTrainer):
     """
     Trainer class for the Structure to Energy & Force (S2EF) and Initial State to
     Relaxed State (IS2RS) tasks.
@@ -159,7 +160,7 @@ class DistillForcesTrainer(BaseTrainer):
         noddp=False,
         name="distill",
         gp_gpus=None,
-        
+         **kwargs
     ):
         if slurm is None:
             slurm = {}
@@ -330,7 +331,7 @@ class DistillForcesTrainer(BaseTrainer):
         ) and first_key.split(".")[1] == "module":
             # No need for OrderedDict since dictionaries are technically ordered
             # since Python 3.6 and officially ordered since Python 3.7
-            new_dict = {k[7:]: v for k, v in checkpoint["state_dict"].items()}
+            new_dict = {k[7:] : v for k, v in checkpoint["state_dict"].items()}
             self.teacher.load_state_dict(new_dict, strict= strict)
         elif distutils.initialized() and first_key.split(".")[1] != "module":
             new_dict = {
@@ -609,21 +610,27 @@ class DistillForcesTrainer(BaseTrainer):
         )
 
     def _node2node_distill_loss(self, out_batch, batch):
+        if out_batch["out"]["node_feature"].shape == out_batch["t_out"]["node_feature"].shape:
+            teacher_node_features = out_batch["t_out"]["node_feature"]
+        else:
+            # for eqv2-eqv2(small) distillatio select the first 4 spherical channels up to L=1 and M=1 
+            teacher_node_features = out_batch["t_out"]["node_feature"].narrow(1,0,4)
+        
         if self.use_mae:
            return torch.nn.functional.l1_loss(
                 out_batch["out"]["node_feature"],
-                out_batch["t_out"]["node_feature"],
+                teacher_node_features,
             )
         elif self.use_huber:
             return torch.nn.functional.huber_loss(
                 out_batch["out"]["node_feature"],
-                out_batch["t_out"]["node_feature"],
+                teacher_node_features,
                 delta=self.huber_delta,
             )
         else:
             return torch.nn.functional.mse_loss(
                 out_batch["out"]["node_feature"],
-                out_batch["t_out"]["node_feature"],
+                teacher_node_features,
             )
 
     def _edge2node_distill_loss(self, out_batch, batch):
@@ -645,8 +652,14 @@ class DistillForcesTrainer(BaseTrainer):
             )
 
     def _edge2edge_distill_loss(self, out_batch, batch):
+        if out_batch["out"]["e2e_feature"].shape == out_batch["t_out"]["edge_feature"].shape:
+            teacher_node_features = out_batch["t_out"]["edge_feature"]
+        else:
+            # for eqv2-eqv2(small) distillatio select the first 4 spherical channels up to L=1 and M=1 
+            teacher_node_features = out_batch["t_out"]["edge_feature"].narrow(1,0,4)
+        
         return torch.nn.functional.mse_loss(
-            out_batch["out"]["e2e_feature"], out_batch["t_out"]["edge_feature"]
+            out_batch["out"]["e2e_feature"], teacher_node_features
         )
 
     def _per_atom_energy_distill_loss(self, out_batch, batch):

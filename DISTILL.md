@@ -30,36 +30,43 @@ python main.py --mode train --config-yml configs/s2ef/200k/painn/eqv2-painn-kd/p
 python main.py --mode train --config-yml configs/s2ef/200k/painn/eqv2-painn-kd/painn_h512_trinity_distill_eqv2.yml
 ```
 
+
+
 # Distill Training - EquiformerV2-EquiformerV2_small
 
 - Baseline: training EquiformerV2_small from scratch
 
 ```
-python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/equiformer_v2_N@12_L@1_M@2.yml
+python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/equiformer_v2_N@12_L@1_M@1.yml --optim.batch_size=1 --optim.eval_batch_size=1
 ```
 
 - node2node Distill
 
 ```
-python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/n2n_distill.yml
+python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/n2n_distill.yml --optim.batch_size=1 --optim.eval_batch_size=1 --task.strict=False
 ```
 
-- edge2node Distill
+- edge2edge Distill
 
 ```
-python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/e2n_distill.yml
+python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/e2e_distill.yml --optim.batch_size=1 --optim.eval_batch_size=1
 ```
+
+- node2node & edge2edge Distill
+
+python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/n2n_e2e_distill.yml --optim.batch_size=1 --optim.eval_batch_size=1
 
 - vec2vec Distill
 
 ```
 python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/v2v_distill.yml
 
-- node2node & edge2node & vec2vec (trinity) Distill
+- node2node & edge2edge & vec2vec (trinity) Distill
 
 ```
 python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/trinity_distill.yml
 ```
+
 
 # Distill Training - Gemnet-oc-PaiNN
 
@@ -99,4 +106,23 @@ python main.py --mode train --config-yml configs/s2ef/200k/painn/eqv2-painn-kd/p
 
 ```
 python main.py --mode train --config-yml configs/s2ef/200k/painn/goc-painn-kd/painn_h512_adversarial_jitter.yml --task.strict=False
+```
+
+
+
+# Distill Training - Gemnet-oc-Gemnet-oc
+
+
+
+- node2node Distill
+
+```
+python main.py --mode train --config-yml configs/s2ef/2M/gemnet/gemnet-oc_small_distill_n2n.yml --optim.batch_size=4 --optim.eval_batch_size=4 --task.strict=False
+```
+
+
+- edge2edge Distill
+
+```
+python main.py --mode train --config-yml configs/s2ef/2M/gemnet/gemnet-oc_small_distill_e2e.yml
 ```

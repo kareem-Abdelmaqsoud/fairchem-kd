@@ -1,0 +1,11 @@
+includes:
+  - configs/s2ef/2M/equiformer_v2/base_distill.yml
+trainer: distill
+distillation:
+  distill_loss: edge2edge_distill_loss 
+  distill_lambda: 5000.0
+
+model:
+  use_distill: True
+  teacher_node_dim: 128
+  teacher_edge_dim: 128

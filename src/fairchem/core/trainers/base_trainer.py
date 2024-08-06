@@ -612,7 +612,6 @@ class BaseTrainer(ABC):
                 lr=self.config["optim"]["lr_initial"],
                 **optimizer_params,
             )
-
     def load_extras(self) -> None:
         self.scheduler = LRScheduler(self.optimizer, self.config["optim"])
         self.clip_grad_norm = aii(

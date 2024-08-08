@@ -13,7 +13,7 @@ model:
   max_radius:               12.0
   max_num_elements:         90
 
-  num_layers:               12
+  num_layers:               8
   sphere_channels:          128
   attn_hidden_channels:     64              # [64, 96] This determines the hidden size of message passing. Do not necessarily use 96.
   num_heads:                8
@@ -22,8 +22,8 @@ model:
   ffn_hidden_channels:      128
   norm_type:                'layer_norm_sh'    # ['rms_norm_sh', 'layer_norm', 'layer_norm_sh']
 
-  lmax_list:                [6]
-  mmax_list:                [2]
+  lmax_list:                [1]
+  mmax_list:                [1]
   grid_resolution:          18              # [18, 16, 14, None] For `None`, simply comment this line.
 
   num_sphere_samples:       128

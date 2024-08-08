@@ -37,24 +37,24 @@ python main.py --mode train --config-yml configs/s2ef/200k/painn/eqv2-painn-kd/p
 - Baseline: training EquiformerV2_small from scratch
 
 ```
-python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/equiformer_v2_N@12_L@1_M@1.yml --optim.batch_size=1 --optim.eval_batch_size=1
+python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/equiformer_v2_N@8_L@1_M@1.yml --optim.batch_size=1 --optim.eval_batch_size=1
 ```
 
 - node2node Distill
 
 ```
-python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/n2n_distill.yml --optim.batch_size=1 --optim.eval_batch_size=1 --task.strict=False
+python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/n2n_distill.yml --optim.batch_size=1 --optim.eval_batch_size=1 
 ```
 
 - edge2edge Distill
 
 ```
-python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/e2e_distill.yml --optim.batch_size=1 --optim.eval_batch_size=1
+python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/e2e_distill.yml --optim.batch_size=1 --optim.eval_batch_size=1 
 ```
 
 - node2node & edge2edge Distill
 
-python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/n2n_e2e_distill.yml --optim.batch_size=1 --optim.eval_batch_size=1
+python main.py --mode train --config-yml configs/s2ef/2M/equiformer_v2/n2n_e2e_distill.yml --optim.batch_size=1 --optim.eval_batch_size=1 
 
 - vec2vec Distill
 

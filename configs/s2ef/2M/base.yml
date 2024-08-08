@@ -3,7 +3,7 @@ trainer: ocp
 dataset:
   train:
     format: lmdb
-    src: /home/jovyan/shared-scratch/kabdelma/knowledge_distillation/lmdbs/train_30k
+    src: /home/jovyan/shared-datasets/OC20/s2ef/2M/train
     key_mapping:
       y: energy
       force: forces
@@ -16,7 +16,7 @@ dataset:
           mean: 0
           stdev: 2.887317180633545
   val:
-    src: /home/jovyan/shared-scratch/kabdelma/knowledge_distillation/lmdbs/val_5k
+    src: /home/jovyan/shared-datasets/OC20/s2ef/all/val_id_30k
 
 logger:
   name: wandb

@@ -69,4 +69,4 @@ optim:
   clip_grad_norm: 100
   ema_decay: 0.999
 
-  eval_every: 5000
+  eval_every: 10000

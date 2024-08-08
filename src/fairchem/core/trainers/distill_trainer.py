@@ -613,8 +613,8 @@ class DistillForcesTrainer(EquiformerV2ForcesTrainer):
         if out_batch["out"]["node_feature"].shape == out_batch["t_out"]["node_feature"].shape:
             teacher_node_features = out_batch["t_out"]["node_feature"]
         else:
-            # for eqv2-eqv2(small) distillatio select the first 4 spherical channels up to L=1 and M=1 
-            teacher_node_features = out_batch["t_out"]["node_feature"].narrow(1,0,4)
+            # for eqv2-eqv2(small) distillation, select the number of spherical channels to match small model
+            teacher_node_features = out_batch["t_out"]["node_feature"].narrow(1,0,out_batch["out"]["node_feature"].shape[1])
         
         if self.use_mae:
            return torch.nn.functional.l1_loss(
@@ -655,8 +655,8 @@ class DistillForcesTrainer(EquiformerV2ForcesTrainer):
         if out_batch["out"]["e2e_feature"].shape == out_batch["t_out"]["edge_feature"].shape:
             teacher_node_features = out_batch["t_out"]["edge_feature"]
         else:
-            # for eqv2-eqv2(small) distillatio select the first 4 spherical channels up to L=1 and M=1 
-            teacher_node_features = out_batch["t_out"]["edge_feature"].narrow(1,0,4)
+            # for eqv2-eqv2(small) distillation, select the number of spherical channels to match small model
+            teacher_node_features = out_batch["t_out"]["edge_feature"].narrow(1,0,out_batch["out"]["e2e_feature"].shape[1])
         
         return torch.nn.functional.mse_loss(
             out_batch["out"]["e2e_feature"], teacher_node_features

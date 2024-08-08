@@ -1,5 +1,5 @@
 includes:
-  - configs/s2ef/2M/equiformer_v2/equiformer_v2_N@12_L@1_M@1.yml
+  - configs/s2ef/2M/equiformer_v2/equiformer_v2_N@8_L@1_M@1.yml
 trainer: distill
 
 model:
